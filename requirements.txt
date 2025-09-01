@@ -1,0 +1,15 @@
+langchain
+langchain-community
+langgraph
+langchain-google-genai
+langsmith
+chromadb
+qdrant-client
+sentence-transformers
+infinity-emb[all]
+rank_bm25
+nltk
+unstructured[all]
+python-dotenv
+pyfiglet
+llm-guard
