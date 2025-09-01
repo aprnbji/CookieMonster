@@ -1,0 +1,9 @@
+CVE/
+database/
+.venv/
+view_database.py
+.env
+test.py
+rag.py
+mixbread.py
+
