@@ -10,18 +10,17 @@ import chromadb
 from infinity_client import Client
 from datetime import datetime
 import pyfiglet
+import json
 
 from sklearn.metrics.pairwise import cosine_similarity
 
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.utilities import GoogleSerperAPIWrapper
-from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers import BM25Retriever, EnsembleRetriever
 from langchain_community.document_compressors.infinity_rerank import InfinityRerank
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
 
-from langchain.retrievers import EnsembleRetriever
 from langchain.retrievers import ContextualCompressionRetriever
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
