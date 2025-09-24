@@ -1,5 +1,12 @@
 from dependencies import *
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger("CookieMonster")
+
 load_dotenv()
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 hf_api_key = os.getenv("HUGGINGFACE_API_KEY")
@@ -12,11 +19,8 @@ llm = ChatGoogleGenerativeAI(
 )
 
 search = GoogleSerperAPIWrapper()
-
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
 reranker = CrossEncoder("mixedbread-ai/mxbai-rerank-xsmall-v1")
-
 
 chroma_client = chromadb.PersistentClient(path="./database")
 cve_collection = chroma_client.get_collection("cve_database")
@@ -43,126 +47,92 @@ hybrid_retriever = EnsembleRetriever(
 
 def expand_query(query: str) -> dict:
     prompt = f"""
-        You are an expert query optimizer. Your task is to expand a user's query into three distinct versions for a Retrieval-Augmented Generation (RAG) system.
+        You are an expert query optimizer. Expand a user's query into three distinct versions for a RAG system.
 
-        The user query is: "{query}"
+        User query: "{query}"
 
         Generate three versions:
-        1.  **original**: The query exactly as it was provided.
-        2.  **broad**: A more generalized version that captures the high-level topic. Remove specific details and focus on the core concept.
-        3.  **specific**: A more detailed version that adds context or focuses on a specific, searchable entity within the query.
+        1. original: The exact query.
+        2. broad: A generalized version.
+        3. specific: A more detailed contextual version.
 
-        Return the result as a single, valid JSON object with the keys "original", "broad", and "specific".
+        Return only valid JSON with keys "original", "broad", and "specific".
+    """
+    response = llm.invoke(prompt)
+    cleaned = response.content.strip()
+    if not cleaned.startswith("{"):
+        cleaned = cleaned[cleaned.find("{"):]
+    if not cleaned.endswith("}"):
+        cleaned = cleaned[:cleaned.rfind("}")+1]
+    expanded = json.loads(cleaned)
 
-        Example:
-        User Query: "log4j vulnerability"
-        {
-            "original": "log4j vulnerability",
-            "broad": "java library security vulnerabilities",
-            "specific": "CVE details for Apache Log4j remote code execution flaw"
-        }
-        """
-    try:
-        response = llm.invoke(prompt)
-        cleaned_response = response.content.strip().replace("```json", "").replace("```", "").strip()
-        expanded = json.loads(cleaned_response)
-    except (json.JSONDecodeError, Exception) as e:
-        # print(f"Warning: Failed to expand query with LLM. Falling back to original. Error: {e}")
-        expanded = {"original": query, "broad": query, "specific": query}
-    
-    # print(f"Expanded Queries: {expanded}")
+    print("Expanded queries:", expanded)
+
     return expanded
 
+
 def ensemble_retrieve(query: str, top_k: int = 5) -> list[Document]:
-    # print(f"\n--- Starting Advanced Retrieval for: '{query}' ---")
-    
     expanded_queries = expand_query(query)
-    
+
     candidate_docs = []
-    seen_contents = set()
+    seen_ids = set()
 
+    # Collect all docs from all expanded queries
     for q_type, q_text in expanded_queries.items():
-        retrieved_docs = hybrid_retriever.invoke(q_text)
-        
-        if retrieved_docs:
-            sentence_pairs = [[q_text, doc.page_content] for doc in retrieved_docs]
-            scores = reranker.predict(sentence_pairs)
-            
-            reranked_pairs = list(zip(scores, retrieved_docs))
-            reranked_pairs.sort(key=lambda x: x[0], reverse=True)
-            
-            # print(f"Found {len(reranked_pairs)} candidates for '{q_type}' variant.")
+        try:
+            retrieved_docs = hybrid_retriever.get_relevant_documents(q_text)
+        except Exception:
+            continue
 
-            for score, doc in reranked_pairs[:5]:  # Take top 5 from each variant
-                if doc.page_content not in seen_contents:
-                    doc.metadata["variant"] = q_type
-                    doc.metadata["local_score"] = float(score)
-                    candidate_docs.append(doc)
-                    seen_contents.add(doc.page_content)
-
-    # print(f"\nTotal unique candidates after local reranking: {len(candidate_docs)}")
+        for doc in retrieved_docs:
+            cve_id = doc.metadata.get("cve_id", doc.metadata.get("title", None))
+            if cve_id and cve_id not in seen_ids:
+                doc.metadata["variant"] = q_type
+                candidate_docs.append(doc)
+                seen_ids.add(cve_id)
 
     if not candidate_docs:
         return []
 
-    global_sentence_pairs = [[query, doc.page_content] for doc in candidate_docs]
-    global_scores = reranker.predict(global_sentence_pairs)
-    
-    final_reranked_pairs = list(zip(global_scores, candidate_docs))
-    final_reranked_pairs.sort(key=lambda x: x[0], reverse=True)
-    
-    final_docs = [doc for score, doc in final_reranked_pairs]
-    # print("--- Advanced Retrieval Finished ---")
-    
-    return final_docs[:top_k]
+    # One global rerank
+    sentence_pairs = [[query, doc.page_content] for doc in candidate_docs]
+    global_scores = reranker.predict(sentence_pairs)
+
+    reranked_pairs = list(zip(global_scores, candidate_docs))
+    reranked_pairs.sort(key=lambda x: x[0], reverse=True)
+
+    return [doc for score, doc in reranked_pairs][:top_k]
 
 
 @tool
-def get_cve_info(query: str) -> str:
+def get_cve_info(query: str) -> list[dict]:
     """
     CVE Lookup Tool
-    Must be used for any query involving CVEs, vulnerabilities, exploits, 
-    or security flaws. This includes named software, libraries, 
-    or general attack descriptions.
-
-    This tool searches the ChromaDB CVE database for relevant vulnerabilities
-    and reranks results using InfinityRerank + CrossEncoder.
-
-    Output Format:
-    Title: <CVE title or ID>
-    Severity: <CVSS severity or 'Unknown'>
-    Summary: <Brief description of the vulnerability>
+    Returns structured JSON with CVE metadata for the given query.
     """
+    
     try:
         results = ensemble_retrieve(query, top_k=5)
     except Exception as e:
-        return f"Error during retrieval: {e}"
+        return [{"error": f"Retrieval failed: {str(e)}"}]
 
     if not results:
-        return "No matching CVEs found in the database."
+        return []
 
-    output_lines = []
+    structured_results = []
     for idx, doc in enumerate(results):
-        title = doc.metadata.get("cve_id", doc.metadata.get("title", f"Doc-{idx+1}"))
-        severity = doc.metadata.get("cvss_v2_severity", doc.metadata.get("severity", "Unknown"))
-        summary = doc.page_content.split("CVSS")[0].strip()
-        variant = doc.metadata.get("variant", "unknown")
+        structured_results.append({
+            "cve_id": doc.metadata.get("cve_id", doc.metadata.get("title", f"Doc-{idx+1}")),
+            "severity": doc.metadata.get("cvss_v2_severity", doc.metadata.get("severity", "Unknown")),
+            "summary": doc.page_content.split("CVSS")[0].strip(),
+            "variant": doc.metadata.get("variant", "unknown")
+        })
 
-        
-        output_lines.append(
-            f"{idx+1}. **{title}** (Severity: {severity})\n   {summary}"
-        )
-
-    return "\n\n".join(output_lines)
-
+    return structured_results
 
 @tool
 def web_search(query: str) -> str:
-    """ 
-    Web Search Tool 
-    This tool performs a web search using the Google Serper API and returns the top result. 
-    It is useful when a user asks for information that can be found online. 
-    """
+    """Web Search Tool using Google Serper API"""
     results = search.run(query)
     return results if results else "No relevant results found."
 
@@ -171,42 +141,58 @@ prompt = """
 You are CookieMonster, a helpful AI assistant.
 You have access to tools that can retrieve information from external databases.
 
+Rules:
 - Always first try to answer using your own knowledge.
-- If the user’s query is relevant to a tool you have access to and you cannot fully or confidently answer from your own knowledge, then use the appropriate tool.
-- Only use a tool when it will significantly improve accuracy or provide missing details.
-- When using a tool, clearly present the result in the required output format.
+- If the user’s query is related to CVEs, vulnerabilities, exploits, or security flaws, use the `get_cve_info` tool.
+- The tool returns structured JSON. Your job is to format this JSON into a **numbered list**.
+- For each CVE, show:
+    1. CVE ID
+    2. Severity
+    3. Summary (1–2 sentences max)
+- If no CVEs are found, say: "I couldn’t find any matching CVEs."
+- If a JSON object has an "error" key, display the error message to the user.
+- Never just dump raw JSON — always present the list in plain text.
 """
 
 agent = create_react_agent(
     llm,
-    tools=[get_cve_info],
+    tools=[get_cve_info, web_search],
     checkpointer=InMemorySaver(),
     prompt=prompt
 )
 
-@traceable(name="CookieMonsterSession")
+
 def run_agent_conversation():
     print(pyfiglet.figlet_format("CookieMonster"))
     print("Hello. Hope you had an ugly day. Type 'exit' or 'quit' to end the conversation.")
-    
+
+    history = []
+
     while True:
         query = input("You: ")
         if query.strip().lower() in ["exit", "quit"]:
             print("GoodbyE Ass")
             break
-        
-        response = agent.invoke(
-            {"messages": [{"role": "user", "content": query}]},
-            config={
-                "configurable": {"thread_id": "1"},
-                "metadata": {
-                    "user": "cli_user",
-                    "session_time": datetime.now().isoformat()
-                }
-            }
-        )
-        print("Response:", response["messages"][-1].content)
 
+        try:
+            response = agent.invoke(
+                {"messages": [{"role": "user", "content": query}]}, 
+                config={
+                    "configurable": {"thread_id": "1"},
+                    "metadata": {
+                        "user": "cli_user",
+                        "session_time": datetime.now().isoformat()
+                    }
+                }
+            )
+            reply = response["messages"][-1].content
+        except Exception as e:
+            reply = f"Agent failed: {e}"
+
+        print("Response:", reply)
+        history.append({"user": query, "agent": reply})
+
+    return history
 
 if __name__ == "__main__":
     run_agent_conversation()

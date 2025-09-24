@@ -11,6 +11,7 @@ from infinity_client import Client
 from datetime import datetime
 import pyfiglet
 import json
+import logging
 
 from sklearn.metrics.pairwise import cosine_similarity
 

@@ -6,4 +6,4 @@ view_database.py
 test.py
 rag.py
 mixbread.py
-
+__pycache__/
