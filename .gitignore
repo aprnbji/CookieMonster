@@ -6,4 +6,6 @@ view_database.py
 test.py
 rag.py
 mixbread.py
-__pycache__/
+/home/garlicbread/work/CookieMonster/CMv2/__pycache__
+data/
+collections.py
