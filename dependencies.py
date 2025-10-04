@@ -40,7 +40,7 @@ from langsmith import traceable
 from sentence_transformers import CrossEncoder
 
 from drain3.template_miner_config import TemplateMinerConfig
-from drain3.persistence import FilePersistence
+from drain3.file_persistence import FilePersistence
 from drain3.template_miner import TemplateMiner
 
 
