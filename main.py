@@ -13,7 +13,7 @@ hf_api_key = os.getenv("HUGGINGFACE_API_KEY")
 serper_api_key = os.getenv("SERPER_API_KEY")
 
 llm = ChatGoogleGenerativeAI(
-    model="gemini-1.5-flash",
+    model="gemini-2.5-pro",
     google_api_key=gemini_api_key,
     temperature=0.2
 )
@@ -103,6 +103,46 @@ def ensemble_retrieve(query: str, top_k: int = 5) -> list[Document]:
 
     return [doc for score, doc in reranked_pairs][:top_k]
 
+@tool
+def analyze_logs(path_or_text: str) -> str:
+    """
+    Analyze plaintext logs (syslog, journalctl, app logs).
+    Accepts either a file path or raw log text.
+    """
+
+    lines = []
+    if os.path.exists(path_or_text):
+        with open(path_or_text, "r", errors="ignore") as f:
+            lines = f.readlines()
+    else:
+        lines = path_or_text.split("\n")
+
+    config = TemplateMinerConfig()
+    persistence = FilePersistence("log.bin")
+    miner = TemplateMiner(persistence, config=config)
+
+    clusters = {}
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        res = miner.add_log_message(line)
+        if res is None:  
+            continue
+        cid = res["cluster_id"]
+        tpl = res["template_mined"]
+        clusters.setdefault(cid, {"template": tpl, "count": 0})
+        clusters[cid]["count"] += 1
+
+    if not clusters:
+        return "No significant log patterns found."
+
+    result = "Log Patterns:\n"
+    for idx, (cid, info) in enumerate(
+        sorted(clusters.items(), key=lambda x: x[1]["count"], reverse=True)[:5], 1
+    ):
+        result += f"{idx}. [{info['count']} occurrences] {info['template']}\n"
+    return result
 
 @tool
 def get_cve_info(query: str) -> list[dict]:
@@ -156,7 +196,7 @@ Rules:
 
 agent = create_react_agent(
     llm,
-    tools=[get_cve_info, web_search],
+    tools=[get_cve_info, web_search, analyze_logs],
     checkpointer=InMemorySaver(),
     prompt=prompt
 )
