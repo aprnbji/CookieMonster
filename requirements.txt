@@ -13,3 +13,4 @@ unstructured[all]
 python-dotenv
 pyfiglet
 llm-guard
+drain3
