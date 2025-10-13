@@ -12,11 +12,13 @@ from datetime import datetime
 import pyfiglet
 import json
 import logging
+import re
 
 from sklearn.metrics.pairwise import cosine_similarity
 
 from langchain_community.utilities import GoogleSerperAPIWrapper
-from langchain.retrievers import BM25Retriever, EnsembleRetriever
+from langchain.retrievers import EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
 from langchain_community.document_compressors.infinity_rerank import InfinityRerank
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -42,6 +44,5 @@ from sentence_transformers import CrossEncoder
 from drain3.template_miner_config import TemplateMinerConfig
 from drain3.file_persistence import FilePersistence
 from drain3.template_miner import TemplateMiner
-
 
 
