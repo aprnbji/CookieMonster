@@ -13,7 +13,7 @@ hf_api_key = os.getenv("HUGGINGFACE_API_KEY")
 serper_api_key = os.getenv("SERPER_API_KEY")
 
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-pro",
+    model="gemini-2.0-flash",
     google_api_key=gemini_api_key,
     temperature=0.2
 )
@@ -47,7 +47,7 @@ hybrid_retriever = EnsembleRetriever(
 
 def expand_query(query: str) -> dict:
     prompt = f"""
-        You are an expert query optimizer. Expand a user's query into three distinct versions for a RAG system.
+        You are a query optimizer. Expand a user's query into three distinct versions for a RAG system.
 
         User query: "{query}"
 
@@ -59,15 +59,21 @@ def expand_query(query: str) -> dict:
         Return only valid JSON with keys "original", "broad", and "specific".
     """
     response = llm.invoke(prompt)
-    cleaned = response.content.strip()
-    if not cleaned.startswith("{"):
-        cleaned = cleaned[cleaned.find("{"):]
-    if not cleaned.endswith("}"):
-        cleaned = cleaned[:cleaned.rfind("}")+1]
-    expanded = json.loads(cleaned)
+    text = response.content.strip()
 
-    print("Expanded queries:", expanded)
+    json_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not json_match:
+        logger.error(f"Failed to extract JSON from model output: {text}")
+        return {"original": query, "broad": query, "specific": query}
 
+    json_str = json_match.group(0)
+    try:
+        expanded = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parsing failed: {e}\nText was:\n{text}")
+        return {"original": query, "broad": query, "specific": query}
+
+    logger.info(f"Expanded queries: {expanded}")
     return expanded
 
 
@@ -77,7 +83,6 @@ def ensemble_retrieve(query: str, top_k: int = 5) -> list[Document]:
     candidate_docs = []
     seen_ids = set()
 
-    # Collect all docs from all expanded queries
     for q_type, q_text in expanded_queries.items():
         try:
             retrieved_docs = hybrid_retriever.get_relevant_documents(q_text)
@@ -94,7 +99,6 @@ def ensemble_retrieve(query: str, top_k: int = 5) -> list[Document]:
     if not candidate_docs:
         return []
 
-    # One global rerank
     sentence_pairs = [[query, doc.page_content] for doc in candidate_docs]
     global_scores = reranker.predict(sentence_pairs)
 
@@ -107,10 +111,9 @@ def ensemble_retrieve(query: str, top_k: int = 5) -> list[Document]:
 def analyze_logs(path_or_text: str) -> str:
     """
     Analyze plaintext logs (syslog, journalctl, app logs).
-    Accepts either a file path or raw log text.
+    Detects common patterns and flags potential anomalies or defects.
     """
 
-    lines = []
     if os.path.exists(path_or_text):
         with open(path_or_text, "r", errors="ignore") as f:
             lines = f.readlines()
@@ -122,27 +125,85 @@ def analyze_logs(path_or_text: str) -> str:
     miner = TemplateMiner(persistence, config=config)
 
     clusters = {}
+    total = 0
     for line in lines:
         line = line.strip()
         if not line:
             continue
         res = miner.add_log_message(line)
-        if res is None:  
+        if res is None:
             continue
         cid = res["cluster_id"]
         tpl = res["template_mined"]
         clusters.setdefault(cid, {"template": tpl, "count": 0})
         clusters[cid]["count"] += 1
+        total += 1
 
     if not clusters:
         return "No significant log patterns found."
 
-    result = "Log Patterns:\n"
+    anomalies = []
+
+    avg_count = total / len(clusters)
+    for cid, info in clusters.items():
+        template = info["template"]
+        count = info["count"]
+
+        if count < 0.1 * avg_count:
+            anomalies.append((cid, "Rare pattern", template))
+
+        if re.search(r"\b(ERROR|Exception|FAIL|CRITICAL|Traceback)\b", template, re.I):
+            anomalies.append((cid, "Error keyword detected", template))
+
+        if count == 1:
+            anomalies.append((cid, "New / unique message", template))
+
+    result = "Log Pattern Summary:\n"
     for idx, (cid, info) in enumerate(
         sorted(clusters.items(), key=lambda x: x[1]["count"], reverse=True)[:5], 1
     ):
         result += f"{idx}. [{info['count']} occurrences] {info['template']}\n"
+
+    result += "\nPotential Anomalies / Defects:\n"
+    if anomalies:
+        for idx, (cid, reason, template) in enumerate(anomalies, 1):
+            result += f"{idx}. [{reason}] {template}\n"
+    else:
+        result += "No clear anomalies detected.\n"
+
     return result
+
+@tool
+def relate(path_or_text: str) -> dict:
+    """
+    Analyzes logs, extracts anomalies, and correlates them with known CVEs.
+    """
+    analysis_output = analyze_logs.invoke(path_or_text)
+    
+    anomalies = []
+    problem = False
+    for line in analysis_output.split("\n"):
+        if "Potential Anomalies" in line:
+            problem = True
+            continue
+        if problem and line.strip() and "]" in line:
+            template = line.split("]", 1)[1].strip()
+            anomalies.append(template)
+
+    if not anomalies:
+        return {
+            "analysis_summary": analysis_output,
+            "mappings": [],
+            "message": "No anomalies found to correlate with CVEs.",
+        }
+
+    mappings = []
+    for template in anomalies:
+        cve_matches = get_cve_info.invoke(template)
+        if cve_matches:
+            mappings.append({"anomaly": template, "cves": cve_matches})
+
+    return {"analysis_summary": analysis_output, "mappings": mappings}
 
 @tool
 def get_cve_info(query: str) -> list[dict]:
@@ -189,6 +250,7 @@ Rules:
     1. CVE ID
     2. Severity
     3. Summary (1–2 sentences max)
+- If a tool output is empty, respond gracefully with context — do not hallucinate CVEs.
 - If no CVEs are found, say: "I couldn’t find any matching CVEs."
 - If a JSON object has an "error" key, display the error message to the user.
 - Never just dump raw JSON — always present the list in plain text.
@@ -196,7 +258,7 @@ Rules:
 
 agent = create_react_agent(
     llm,
-    tools=[get_cve_info, web_search, analyze_logs],
+    tools=[get_cve_info, web_search, analyze_logs, relate],
     checkpointer=InMemorySaver(),
     prompt=prompt
 )
@@ -205,6 +267,8 @@ agent = create_react_agent(
 def run_agent_conversation():
     print(pyfiglet.figlet_format("CookieMonster"))
     print("Hello. Hope you had an ugly day. Type 'exit' or 'quit' to end the conversation.")
+
+    thread_id = f"cli_session_{int(time.time())}"
 
     history = []
 
@@ -218,7 +282,7 @@ def run_agent_conversation():
             response = agent.invoke(
                 {"messages": [{"role": "user", "content": query}]}, 
                 config={
-                    "configurable": {"thread_id": "1"},
+                    "configurable": {"thread_id": thread_id},
                     "metadata": {
                         "user": "cli_user",
                         "session_time": datetime.now().isoformat()
